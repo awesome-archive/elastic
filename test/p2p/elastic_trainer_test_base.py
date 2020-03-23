@@ -20,7 +20,9 @@ import torch
 import torch.distributed as dist
 import torchelastic.train_loop as elastic_train_loop
 from test_mocks import (
+    RadixTestDataset,
     TestCoordinatorP2P,
+    TestDataset,
     TestState,
     TestStateFailOnSync,
     TestStateWithRollbackDisabled,
@@ -29,6 +31,7 @@ from test_mocks import (
 )
 from test_utils import TestCommon, _get_or_raise
 from torchelastic.checkpoint import FileSystemCheckpointManager
+from torchelastic.coordinator import NonRetryableException
 from torchelastic.p2p.coordinator_p2p import CoordinatorP2P
 
 
@@ -63,7 +66,8 @@ def _train_step(state, hooks):
     state.total_sum += int(tensor[0])
     log.info(
         f"After all_reduce: rank {state.get_worker_rank()}, "
-        f"sample {sample}, start_index {state.dataset.start_index}, "
+        f"sample {sample}, "
+        f"PID: {os.getpid()}"
         f"train step sum: {int(tensor[0])}, total sum: {state.total_sum}"
     )
     state.nums.append(sample)
@@ -138,13 +142,15 @@ class ElasticTrainerTestBase(TestCommon, abc.ABC):
         state = elastic_train_loop.train(elastic_coordinator, elastic_train_step, state)
         return state
 
-    def _train(self, _, run_id, train_step, hooks, state_override=None):
+    def _train(self, _, run_id, train_step, hooks, state_override=None, timeout=600):
         """
         Common sub-process trainer entry point used by most tests.
         """
         elastic_coordinator = CoordinatorP2P(
             c10d_backend="gloo",
-            init_method=self.get_rdzv_url(run_id, self.min_size, self.max_size),
+            init_method=self.get_rdzv_url(
+                run_id, self.min_size, self.max_size, timeout=timeout
+            ),
             max_num_trainers=self.max_size,
             process_group_timeout=10000,
         )
@@ -249,6 +255,31 @@ class ElasticTrainerTestBase(TestCommon, abc.ABC):
         self.assertEqual([13, 17, 21, 25, 29], nums[2])
         self.assertEqual([14, 18, 22, 26, 30], nums[3])
         self.assertEqual([410, 410, 410, 410], sums)  # 410 = 11 + 12 + ... + 30
+
+    def test_rdzv_timeout(self):
+        """
+        Test timeout exception.
+        """
+        run_id = self._generate_run_id()
+
+        nprocs = 4
+        self.min_size = nprocs
+        qouts = []
+        qerrs = []
+        timeout = 30
+        for _ in range(0, nprocs - 1):
+            _, qout, qerr = self._spawn(
+                self._train, run_id, _train_step, None, None, timeout
+            )
+            qouts.append(qout)
+            qerrs.append(qerr)
+
+        # get the samples that each worker processed and assert against input data
+        for i in range(0, nprocs - 1):
+            with self.assertRaises(NonRetryableException) as err:
+                _get_or_raise(qouts[i], qerrs[i])
+                pattern = "permanently stuck"
+                self.assertTrue(str(err).find(pattern) > 0)
 
     def test_normal_flow_with_worker_stats(self):
         """
@@ -366,6 +397,55 @@ class ElasticTrainerTestBase(TestCommon, abc.ABC):
 
         # We re-rendezvous on every iteration, but result should be as normal.
         self.assertEqual([410, 410, 410, 410], sums)
+
+    def test_process_rerendezvous_after_closed(self):
+        run_id = self._generate_run_id()
+
+        nprocs = 4
+        qouts = []
+        qerrs = []
+
+        def train_with_non_aligned_dataset(_, run_id, train_step, hooks):
+            state = TestState()
+            # generate a dataset that cannot be equally divided, eg: [11:33], there
+            # will be 22 elements, cannot be divided by 4 trainers, in this case
+            # 2 trainers got last data while the other 2 will hit EOF and exit,
+            # the early existed trainer will close rendezvous.
+            state.dataset = TestDataset(11, 33)
+            return self._train(_, run_id, train_step, hooks, state)
+
+        for _ in range(0, nprocs):
+            _, qout, qerr = self._spawn(
+                train_with_non_aligned_dataset, run_id, _train_step, None
+            )
+            qouts.append(qout)
+            qerrs.append(qerr)
+
+        # get the samples that each worker processed and assert against input data
+        nums = {}
+        sums = []
+        for i in range(0, nprocs):
+            state = _get_or_raise(qouts[i], qerrs[i])
+            self.assertEqual(5, len(state.nums))
+            nums[state.get_worker_rank()] = state.nums
+            sums.append(state.total_sum)
+
+        self._wait_all_and_clean()
+        # created a new trainer, it should exit directly as training complete
+        _, qout, qerr = self._spawn(
+            train_with_non_aligned_dataset, run_id, _train_step, None
+        )
+        qouts.append(qout)
+        qerrs.append(qerr)
+        self.assertEqual(5, len(state.nums))
+
+        # All 4 trainers should train 5 samples without issue
+        # (due to no re-rendezvous, we can assume rank-stability)
+        self.assertEqual([11, 15, 19, 23, 27], nums[0])
+        self.assertEqual([12, 16, 20, 24, 28], nums[1])
+        self.assertEqual([13, 17, 21, 25, 29], nums[2])
+        self.assertEqual([14, 18, 22, 26, 30], nums[3])
+        self.assertEqual([410, 410, 410, 410], sums)  # 410 = 11 + 12 + ... + 30
 
     def test_process_retryable_exception(self):
         """
@@ -757,8 +837,10 @@ class ElasticTrainerTestBase(TestCommon, abc.ABC):
         qouts = []
         qerrs = []
 
+        state = TestState(RadixTestDataset(max_iter=6))
+
         for _ in range(0, 2):
-            _, qout, qerr = self._spawn(self._train, run_id, _train_step, hooks)
+            _, qout, qerr = self._spawn(self._train, run_id, _train_step, hooks, state)
             qouts.append(qout)
             qerrs.append(qerr)
 
@@ -777,7 +859,9 @@ class ElasticTrainerTestBase(TestCommon, abc.ABC):
             CoordinatorP2P, "rendezvous_barrier", patched_rendezvous_barrier
         ):
             for _ in range(0, 2):
-                _, qout, qerr = self._spawn(self._train, run_id, _train_step, None)
+                _, qout, qerr = self._spawn(
+                    self._train, run_id, _train_step, None, state
+                )
                 qouts.append(qout)
                 qerrs.append(qerr)
 
@@ -786,13 +870,12 @@ class ElasticTrainerTestBase(TestCommon, abc.ABC):
             state = _get_or_raise(qouts[i], qerrs[i])
             sums.append(state.total_sum)
 
-        # Everyone (including late workers) arrive at the same "model".
-        # Near the end of training, there are 2 samples left, with 4 trainers.
-        # Depending on how end-of-data condition is handled, the result can be that:
-        #  a) all workers stop at total sum 351
-        #  b) some workes continue to add remaining 29+30 to the sum and see 410.
-        self.assertSetEqual(set(sums) - {351, 410}, set())
-        # (i.e. sums contains only 410, 351, or both)
+        # The first three iterations are executed by two workers
+        early_iter = RadixTestDataset.get_expected_sum(3, [0, 1])
+        # The rest of the workload is distributed to four workers
+        late_iter = RadixTestDataset.get_expected_sum(7, [0, 1, 2, 3], start_iter=4)
+        for sum in sums:
+            self.assertEqual(sum, early_iter + late_iter)
 
 
 if __name__ == "__main__":

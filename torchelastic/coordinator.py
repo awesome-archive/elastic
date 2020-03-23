@@ -11,7 +11,7 @@ import abc
 
 class StopException(Exception):
     """
-    Raised to singal that the Coordinator wants the caller to exit cleanly.
+    Raised to signal that the Coordinator wants the caller to exit cleanly.
     """
 
     pass
@@ -19,7 +19,7 @@ class StopException(Exception):
 
 class NonRetryableException(Exception):
     """
-    Raised to singal that the Coordinator issued an unclean shutdown
+    Raised to signal that the Coordinator issued an unclean shutdown
     and the callers should not retry on it.
     """
 
@@ -36,7 +36,7 @@ class Coordinator(abc.ABC):
     def __init__(self):
         """
         Derived versions of this class should configure rendezvous parameters
-        in the constructor, e.g. min_nodess, max_nodes, rendezvous timeout,
+        in the constructor, e.g. min_nodes, max_nodes, rendezvous timeout,
         rendezvous timeout for min nodes, collective timeout etc
         """
 
@@ -47,6 +47,17 @@ class Coordinator(abc.ABC):
         """
         Acquire the next version of rendezvous.
         Return Tuple[store(c10dStore), rank(int), world_size(int)]
+        """
+        pass
+
+    @abc.abstractmethod
+    def barrier(self):
+        """
+        A regular barrier (no rendezvous) for synchronizing trainers.
+         - This method throws a RuntimeError if not all workers reach join the
+           barrier within a specified timeout. The timeout value is implementation
+           specific.
+         - If `barrier()` throws in one trainer, other trainers should throw.
         """
         pass
 
